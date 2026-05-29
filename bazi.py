@@ -1,5 +1,7 @@
 from datetime import date as _Date
 
+__version__ = "2.0.0"
+
 STEMS    = ["甲","乙","丙","丁","戊","己","庚","辛","壬","癸"]
 STEMS_EN = ["Jiǎ","Yǐ","Bǐng","Dīng","Wù","Jǐ","Gēng","Xīn","Rén","Guǐ"]
 STEMS_EL = ["Yang Wood","Yin Wood","Yang Fire","Yin Fire","Yang Earth",
