@@ -4,7 +4,7 @@ An AI-powered Four Pillars of Destiny (BaZi) calculator and interpreter built wi
 
 Users enter their birth date, time, and gender. The app calculates their full BaZi chart — including hidden stems, special stars, and 10-year luck pillars — then uses Gemini to deliver a multi-section AI reading, annual forecast, compatibility analysis, and an interactive chart Q&A.
 
-Live demo: *(add your Streamlit Cloud URL here after deployment)*
+Live demo: *https://px-bazireader.streamlit.app/*
 
 ---
 
