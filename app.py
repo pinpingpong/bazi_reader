@@ -1,10 +1,12 @@
 import os
+from datetime import date as _Date
 import streamlit as st
 from dotenv import load_dotenv
 import google.generativeai as genai
 
 from bazi import (
-    calculate_bazi,
+    calculate_bazi, calculate_da_yun, get_special_stars,
+    get_hidden_stems, get_current_pillars,
     STEMS, STEMS_EN, STEMS_EL,
     BRANCHES, BR_EN, ANIMALS, BR_EL, BR_POL,
     stem_elem, branch_elem,
@@ -14,31 +16,28 @@ load_dotenv()
 
 st.set_page_config(page_title="AI BaZi Reader 八字", page_icon="☯", layout="centered")
 
-# ── Styling ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   [data-testid="stAppViewContainer"] { background: #f8f7f4; }
   [data-testid="stForm"] { background: transparent; border: none; padding: 0; }
-  div[data-testid="stNumberInput"] input,
-  div[data-testid="stSelectbox"] div { border-radius: 8px !important; }
   .stButton > button {
     border-radius: 8px; border: 0.5px solid #aaa;
     background: #fff; font-weight: 500;
   }
   .stButton > button:hover { background: #f0eeeb; }
   hr { margin: 1rem 0; }
+  [data-testid="stChatMessage"] { background: transparent; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ECOL = {
-    "Wood":  {"bg": "#EAF3DE", "tx": "#3B6D11", "bar": "#639922"},
-    "Fire":  {"bg": "#FAECE7", "tx": "#993C1D", "bar": "#D85A30"},
-    "Earth": {"bg": "#FAEEDA", "tx": "#854F0B", "bar": "#BA7517"},
-    "Metal": {"bg": "#F1EFE8", "tx": "#5F5E5A", "bar": "#888780"},
-    "Water": {"bg": "#E6F1FB", "tx": "#185FA5", "bar": "#378ADD"},
+    "Wood":  {"bg":"#EAF3DE","tx":"#3B6D11","bar":"#639922"},
+    "Fire":  {"bg":"#FAECE7","tx":"#993C1D","bar":"#D85A30"},
+    "Earth": {"bg":"#FAEEDA","tx":"#854F0B","bar":"#BA7517"},
+    "Metal": {"bg":"#F1EFE8","tx":"#5F5E5A","bar":"#888780"},
+    "Water": {"bg":"#E6F1FB","tx":"#185FA5","bar":"#378ADD"},
 }
-
 DM_DESC = {
     "Yang Wood":  "A great tree — upright, ambitious, always reaching for the sky. Leadership comes naturally.",
     "Yin Wood":   "A flower or vine — graceful, adaptable, tenacious. Bends but never breaks.",
@@ -51,6 +50,26 @@ DM_DESC = {
     "Yang Water": "The ocean — vast, deep, philosophical. Absorbs everything, flows everywhere.",
     "Yin Water":  "Morning dew — gentle, intuitive, emotionally perceptive. Feels everything.",
 }
+STAR_DESC = {
+    "Nobleman Star 天乙贵人": "People in power readily help you — mentors, sponsors, helpful strangers appear at key moments.",
+    "Peach Blossom 桃花":     "Strong romantic magnetism and social charm. You attract others effortlessly.",
+    "Academic Star 文昌":     "Sharp intellect, love of learning, and talent for writing or strategic thinking.",
+    "Travelling Horse 驿马":  "Restless energy favouring travel, relocation, and career mobility.",
+    "Canopy Star 华盖":       "Spiritual depth, artistic sensitivity, and a tendency toward solitude and introspection.",
+}
+
+# ── Session state init ────────────────────────────────────────────────────────
+ss = st.session_state
+ss.setdefault("form_submitted", False)
+ss.setdefault("birth_info", None)
+ss.setdefault("chart", None)
+ss.setdefault("da_yun", None)
+ss.setdefault("stars", None)
+ss.setdefault("reading", None)
+ss.setdefault("forecast", None)
+ss.setdefault("compat_reading", None)
+ss.setdefault("chat_display", [])
+ss.setdefault("chat_history", [])   # Gemini format
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -61,13 +80,24 @@ def get_api_key() -> str:
         return os.getenv("GEMINI_API_KEY", "")
 
 
-def pillar_card(label: str, si: int, bi: int, is_dm: bool = False) -> str:
+def gemini_model():
+    genai.configure(api_key=get_api_key())
+    return genai.GenerativeModel("gemini-flash-latest")
+
+
+def pillar_card(label, si, bi, is_dm=False):
     se = stem_elem(si)
-    c = ECOL[se]
-    border  = "2px solid #378ADD" if is_dm else "0.5px solid #ddd"
-    lbg     = "#E6F1FB" if is_dm else "#f4f3f0"
-    ltx     = "#185FA5" if is_dm else "#999"
-    dm_tag  = " · Day Master" if is_dm else ""
+    c  = ECOL[se]
+    border = "2px solid #378ADD" if is_dm else "0.5px solid #ddd"
+    lbg    = "#E6F1FB" if is_dm else "#f4f3f0"
+    ltx    = "#185FA5" if is_dm else "#999"
+    dm_tag = " · Day Master" if is_dm else ""
+    hs_html = "".join(
+        f'<span style="font-size:9px;padding:1px 5px;border-radius:6px;margin:1px;'
+        f'background:{ECOL[stem_elem(idx)]["bg"]};color:{ECOL[stem_elem(idx)]["tx"]}">'
+        f'{STEMS[idx]} {w}</span>'
+        for idx, w in get_hidden_stems(bi)
+    )
     return f"""
     <div style="border:{border};border-radius:12px;overflow:hidden;
                 text-align:center;background:#fff;flex:1;min-width:0">
@@ -76,158 +106,480 @@ def pillar_card(label: str, si: int, bi: int, is_dm: bool = False) -> str:
       <div style="padding:14px 6px 8px">
         <div style="font-size:30px;line-height:1;margin-bottom:3px">{STEMS[si]}</div>
         <div style="font-size:11px;color:#888">{STEMS_EN[si]}</div>
-        <div style="margin:4px 0 6px">
-          <span style="display:inline-block;font-size:10px;font-weight:500;
-                       padding:2px 8px;border-radius:12px;
-                       background:{c['bg']};color:{c['tx']}">{STEMS_EL[si]}</span>
-        </div>
+        <span style="display:inline-block;font-size:10px;font-weight:500;
+                     padding:2px 8px;border-radius:12px;margin:4px 0 6px;
+                     background:{c['bg']};color:{c['tx']}">{STEMS_EL[si]}</span>
       </div>
-      <div style="border-top:0.5px solid #eee;padding:10px 6px 12px;background:#f8f7f4">
-        <div style="font-size:24px;line-height:1;margin-bottom:4px">{BRANCHES[bi]}</div>
+      <div style="border-top:0.5px solid #eee;padding:8px 6px 6px;background:#f8f7f4">
+        <div style="font-size:24px;line-height:1;margin-bottom:3px">{BRANCHES[bi]}</div>
         <div style="font-size:12px;font-weight:500">{ANIMALS[bi]}</div>
         <div style="font-size:10px;color:#888;margin-top:2px">{BR_EL[bi]} · {BR_POL[bi]}</div>
+        <div style="margin-top:5px;display:flex;flex-wrap:wrap;justify-content:center;gap:2px">{hs_html}</div>
       </div>
     </div>"""
 
 
-def build_prompt(year, month, day, hour, minute, gender, chart, current_year=2026) -> str:
-    ys, yb = chart["year"]
-    ms, mb = chart["month"]
-    ds, db = chart["day"]
-    hs, hb = chart["hour"]
+def da_yun_card(p, birth_year, is_active):
+    si, bi = p["si"], p["bi"]
+    c      = ECOL[stem_elem(si)]
+    border = "2px solid #378ADD" if is_active else "0.5px solid #ddd"
+    lbg    = "#E6F1FB" if is_active else "#f4f3f0"
+    ltx    = "#185FA5" if is_active else "#999"
+    sy, ey = birth_year + p["start_age"], birth_year + p["end_age"]
+    return f"""
+    <div style="border:{border};border-radius:12px;overflow:hidden;text-align:center;
+                background:#fff;flex:0 0 auto;min-width:78px">
+      <div style="font-size:9px;color:{ltx};background:{lbg};padding:4px 2px">
+        {p['start_age']}–{p['end_age']}{'  ★' if is_active else ''}</div>
+      <div style="padding:10px 4px 6px">
+        <div style="font-size:26px;line-height:1;margin-bottom:2px">{STEMS[si]}</div>
+        <div style="font-size:9px;color:#888">{STEMS_EN[si]}</div>
+        <span style="font-size:9px;padding:1px 6px;border-radius:8px;
+                     background:{c['bg']};color:{c['tx']}">{STEMS_EL[si]}</span>
+      </div>
+      <div style="border-top:0.5px solid #eee;padding:8px 4px 10px;background:#f8f7f4">
+        <div style="font-size:20px;line-height:1;margin-bottom:3px">{BRANCHES[bi]}</div>
+        <div style="font-size:10px;font-weight:500">{ANIMALS[bi]}</div>
+        <div style="font-size:9px;color:#aaa;margin-top:2px">{sy}–{ey}</div>
+      </div>
+    </div>"""
+
+
+def elem_balance_html(ec):
+    max_e = max(ec.values()) or 1
+    cards = "".join(
+        f'<div style="background:{ECOL[el]["bg"]};border-radius:8px;padding:8px 4px;'
+        f'text-align:center;flex:1">'
+        f'<div style="font-size:10px;font-weight:500;color:{ECOL[el]["tx"]};margin-bottom:3px">{el}</div>'
+        f'<div style="font-size:18px;font-weight:500;color:{ECOL[el]["bar"]}">{ec[el]}</div>'
+        f'<div style="height:3px;border-radius:2px;background:#ddd;margin:5px 6px 0">'
+        f'<div style="height:3px;border-radius:2px;background:{ECOL[el]["bar"]};'
+        f'width:{round(ec[el]/max_e*100)}%"></div></div></div>'
+        for el in ["Wood","Fire","Earth","Metal","Water"]
+    )
+    return f'<div style="display:flex;gap:8px">{cards}</div>'
+
+
+def chart_text(chart, year, month, day, hour, minute, gender, da_yun, stars):
+    """Compact text summary used in prompts and export."""
+    ys,yb = chart["year"]; ms,mb = chart["month"]
+    ds,db = chart["day"];  hs,hb = chart["hour"]
     ec = chart["elements"]
-    dm_name = STEMS_EL[ds]
+    dy = da_yun
+    lines = [
+        f"Birth: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d} UTC+8 | Gender: {gender}",
+        "",
+        "FOUR PILLARS",
+        f"Hour   : {STEMS_EN[hs]} {STEMS[hs]} ({STEMS_EL[hs]}) / {BR_EN[hb]} {BRANCHES[hb]} ({BR_EL[hb]} {BR_POL[hb]}) {ANIMALS[hb]}",
+        f"Day ★  : {STEMS_EN[ds]} {STEMS[ds]} ({STEMS_EL[ds]}) / {BR_EN[db]} {BRANCHES[db]} ({BR_EL[db]} {BR_POL[db]}) {ANIMALS[db]}",
+        f"Month  : {STEMS_EN[ms]} {STEMS[ms]} ({STEMS_EL[ms]}) / {BR_EN[mb]} {BRANCHES[mb]} ({BR_EL[mb]} {BR_POL[mb]}) {ANIMALS[mb]}",
+        f"Year   : {STEMS_EN[ys]} {STEMS[ys]} ({STEMS_EL[ys]}) / {BR_EN[yb]} {BRANCHES[yb]} ({BR_EL[yb]} {BR_POL[yb]}) {ANIMALS[yb]}",
+        "",
+        f"Day Master: {STEMS_EL[ds]} ({STEMS[ds]}) — {DM_DESC.get(STEMS_EL[ds],'')}",
+        "",
+        f"Element Balance: Wood {ec['Wood']} | Fire {ec['Fire']} | Earth {ec['Earth']} | Metal {ec['Metal']} | Water {ec['Water']}",
+        "",
+        "DA YUN (10-year luck pillars):",
+    ]
+    for p in dy["pillars"]:
+        lines.append(f"  Age {p['start_age']}-{p['end_age']}: {STEMS_EL[p['si']]} / {BR_EL[p['bi']]} {ANIMALS[p['bi']]}")
+    if stars:
+        lines.append("\nSPECIAL STARS: " + ", ".join(stars.keys()))
+    return "\n".join(lines)
 
-    return f"""You are an expert BaZi (Four Pillars of Destiny) consultant with deep knowledge of Chinese metaphysics. Analyse the chart below and provide a warm, insightful, and practical reading.
 
-**Birth:** {year}-{month:02d}-{day:02d}  {hour:02d}:{minute:02d}  (UTC+8)  |  Gender: {gender}
+# ── Prompt builders ────────────────────────────────────────────────────────────
+def build_natal_prompt(chart, year, month, day, hour, minute, gender, da_yun, stars):
+    ctx = chart_text(chart, year, month, day, hour, minute, gender, da_yun, stars)
+    active = next((p for p in da_yun["pillars"]
+                   if p["start_age"] <= (_Date.today().year - year) <= p["end_age"]), None)
+    active_str = ""
+    if active:
+        active_str = (f"\nCurrently in Da Yun: {STEMS_EL[active['si']]} / "
+                      f"{BR_EL[active['bi']]} {ANIMALS[active['bi']]} "
+                      f"(Age {active['start_age']}–{active['end_age']})")
+    star_notes = "\n".join(f"- {k}: {STAR_DESC.get(k,'')}" for k in stars) if stars else "None detected."
+    return f"""You are an expert BaZi (Four Pillars of Destiny) consultant. Analyse the chart and give a warm, specific, and actionable reading.
 
-**Four Pillars:**
-| Pillar | Stem | Branch |
-|--------|------|--------|
-| Hour   | {STEMS_EN[hs]} {STEMS[hs]} — {STEMS_EL[hs]} | {BR_EN[hb]} {BRANCHES[hb]} — {BR_EL[hb]} {BR_POL[hb]} ({ANIMALS[hb]}) |
-| Day ★  | {STEMS_EN[ds]} {STEMS[ds]} — {STEMS_EL[ds]} | {BR_EN[db]} {BRANCHES[db]} — {BR_EL[db]} {BR_POL[db]} ({ANIMALS[db]}) |
-| Month  | {STEMS_EN[ms]} {STEMS[ms]} — {STEMS_EL[ms]} | {BR_EN[mb]} {BRANCHES[mb]} — {BR_EL[mb]} {BR_POL[mb]} ({ANIMALS[mb]}) |
-| Year   | {STEMS_EN[ys]} {STEMS[ys]} — {STEMS_EL[ys]} | {BR_EN[yb]} {BRANCHES[yb]} — {BR_EL[yb]} {BR_POL[yb]} ({ANIMALS[yb]}) |
+{ctx}{active_str}
 
-**Day Master:** {dm_name} ({STEMS[ds]}) — {DM_DESC.get(dm_name, '')}
+Special Stars present:
+{star_notes}
 
-**Element Balance (stems + branch main qi):**
-Wood {ec['Wood']}  |  Fire {ec['Fire']}  |  Earth {ec['Earth']}  |  Metal {ec['Metal']}  |  Water {ec['Water']}
-
-Please structure your response with these seven sections:
-
-1. **Character & Personality** — based on the Day Master and chart balance
+Provide seven sections:
+1. **Character & Personality** — Day Master archetype and chart balance
 2. **Strengths & Natural Talents** — what this person excels at
-3. **Challenges & Growth Areas** — elements or patterns to be mindful of
-4. **Career & Life Path** — suitable directions and vocations
-5. **Relationships & Love** — approach to partnerships and compatibility
+3. **Challenges & Growth Areas** — elemental gaps or tensions to navigate
+4. **Career & Life Path** — suitable directions, industries, working styles
+5. **Relationships & Love** — approach to partnerships, compatibility themes
 6. **Health Tendencies** — areas to watch based on elemental imbalances
-7. **{current_year} Forecast** — what energies are active this year and key themes
+7. **Current Luck Period** — what the active Da Yun and current year bring
 
-Use relatable modern language alongside Chinese metaphysical concepts. Be specific, warm, and actionable — avoid vague generalities.
+Use relatable modern language alongside Chinese metaphysical concepts. Be specific and avoid vague generalities.
 """
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+def build_forecast_prompt(chart, year, month, day, hour, minute, gender, da_yun):
+    ctx = chart_text(chart, year, month, day, hour, minute, gender, da_yun, {})
+    cy_pillar, cm_pillar = get_current_pillars()
+    cy_si, cy_bi = cy_pillar
+    cm_si, cm_bi = cm_pillar
+    today = _Date.today()
+    current_age = today.year - year
+    active = next((p for p in da_yun["pillars"]
+                   if p["start_age"] <= current_age <= p["end_age"]), da_yun["pillars"][0])
+    return f"""You are a BaZi consultant specialising in annual and monthly forecasts.
+
+{ctx}
+
+CURRENT PERIOD CONTEXT
+Today: {today.strftime('%B %d, %Y')} | Age: {current_age}
+Current Solar Year Pillar: {STEMS_EL[cy_si]} ({STEMS[cy_si]}) / {BR_EL[cy_bi]} {ANIMALS[cy_bi]}
+Current Month Pillar: {STEMS_EL[cm_si]} ({STEMS[cm_si]}) / {BR_EL[cm_bi]} {ANIMALS[cm_bi]}
+Active Da Yun: {STEMS_EL[active['si']]} / {BR_EL[active['bi']]} {ANIMALS[active['bi']]} (Age {active['start_age']}–{active['end_age']})
+
+Please provide:
+1. **Overall {today.year} Theme** — how the year pillar interacts with the natal chart and Da Yun
+2. **Key Opportunities in {today.year}** — 2-3 specific areas to focus on
+3. **Cautions for {today.year}** — energies to be mindful of
+4. **Monthly Snapshot (remaining months of {today.year})** — one paragraph per month from {today.strftime('%B')} through December, covering the dominant energy and suggested focus
+
+Be specific and practical. Name the relevant pillars when explaining interactions.
+"""
+
+
+def build_compat_prompt(chart1, y1, m1, d1, h1, mi1, g1,
+                        chart2, y2, m2, d2, h2, mi2, g2):
+    c1 = chart_text(chart1, y1, m1, d1, h1, mi1, g1, {"pillars":[],"start_years":0,"start_months":0,"forward":True}, {})
+    c2 = chart_text(chart2, y2, m2, d2, h2, mi2, g2, {"pillars":[],"start_years":0,"start_months":0,"forward":True}, {})
+    dm1 = STEMS_EL[chart1["day"][0]]
+    dm2 = STEMS_EL[chart2["day"][0]]
+    return f"""You are a BaZi compatibility consultant. Analyse the two charts below and provide a detailed compatibility reading.
+
+=== PERSON 1 ({g1}) — Day Master: {dm1} ===
+{c1}
+
+=== PERSON 2 ({g2}) — Day Master: {dm2} ===
+{c2}
+
+Provide:
+1. **Overall Compatibility Score** — rate 1–10 with explanation
+2. **Natural Synergies** — where these two charts complement and support each other
+3. **Friction Points** — clashing elements or branches to be aware of
+4. **Romantic / Partnership Dynamics** — how they relate in close relationships
+5. **Career & Financial Compatibility** — can they build together effectively?
+6. **Advice for Both** — practical tips to bring out the best in this pairing
+
+Be honest, balanced, and specific. Reference the actual pillar interactions.
+"""
+
+
+def build_chat_context(chart, da_yun, year, month, day, hour, minute, gender, stars):
+    ctx = chart_text(chart, year, month, day, hour, minute, gender, da_yun, stars)
+    return (
+        f"You are a knowledgeable and warm BaZi consultant. "
+        f"The user wants to discuss their chart. Answer their questions with specific references to their pillars.\n\n"
+        f"{ctx}\n\n"
+        f"Ready to answer their questions."
+    )
+
+
+# ── URL param helpers ─────────────────────────────────────────────────────────
+def _pi(k, d):
+    try: return int(st.query_params[k])
+    except: return d
+
+def _ps(k, d):
+    try: return str(st.query_params[k])
+    except: return d
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("<h1 style='font-size:22px;font-weight:600;margin-bottom:2px'>BaZi Reader 八字</h1>",
             unsafe_allow_html=True)
 st.markdown("<p style='color:#888;font-size:13px;margin-bottom:1.2rem'>AI-powered Four Pillars of Destiny analysis</p>",
             unsafe_allow_html=True)
 
+# ── Input form ────────────────────────────────────────────────────────────────
 with st.form("bazi_form"):
     c1, c2, c3 = st.columns(3)
-    year   = c1.number_input("Year",       min_value=1900, max_value=2100, value=2004)
-    month  = c2.number_input("Month",      min_value=1,    max_value=12,   value=12)
-    day    = c3.number_input("Day",        min_value=1,    max_value=31,   value=2)
-
+    year   = c1.number_input("Year",        min_value=1900, max_value=2100, value=_pi("yr", 2004))
+    month  = c2.number_input("Month",       min_value=1,    max_value=12,   value=_pi("mo", 12))
+    day    = c3.number_input("Day",         min_value=1,    max_value=31,   value=_pi("dy", 2))
     c4, c5, c6 = st.columns(3)
-    hour   = c4.number_input("Hour (0–23)", min_value=0, max_value=23, value=9)
-    minute = c5.number_input("Minute",      min_value=0, max_value=59, value=31)
-    gender = c6.selectbox("Gender", ["Female", "Male"])
-
-    st.caption("UTC+8 — Singapore / HK / China / Malaysia. No longitude correction applied.")
+    hour   = c4.number_input("Hour (0–23)", min_value=0,    max_value=23,   value=_pi("hr", 9))
+    minute = c5.number_input("Minute",      min_value=0,    max_value=59,   value=_pi("mn", 31))
+    gender = c6.selectbox("Gender", ["Female","Male"],
+                          index=1 if _ps("gd","F") == "M" else 0)
+    st.caption("UTC+8 — Singapore / HK / China / Malaysia. No longitude correction.")
     submitted = st.form_submit_button("Calculate & Analyse →", use_container_width=True)
 
-if not submitted:
+if submitted:
+    new_info = (int(year), int(month), int(day), int(hour), int(minute), gender)
+    if ss.birth_info != new_info:
+        ss.reading = None
+        ss.forecast = None
+        ss.compat_reading = None
+        ss.chat_display = []
+        ss.chat_history = []
+        ss.birth_info = new_info
+        ss.chart  = calculate_bazi(*new_info[:5])
+        ss.da_yun = calculate_da_yun(*new_info[:5], new_info[5])
+        ss.stars  = get_special_stars(ss.chart)
+    ss.form_submitted = True
+    st.query_params.update({"yr":int(year),"mo":int(month),"dy":int(day),
+                            "hr":int(hour),"mn":int(minute),"gd":gender[0]})
+
+if not ss.form_submitted:
     st.stop()
 
-# ── Calculate ─────────────────────────────────────────────────────────────────
-chart = calculate_bazi(int(year), int(month), int(day), int(hour), int(minute))
-ys, yb = chart["year"]
-ms, mb = chart["month"]
-ds, db = chart["day"]
-hs, hb = chart["hour"]
+# ── Unpack session state ───────────────────────────────────────────────────────
+year, month, day, hour, minute, gender = ss.birth_info
+chart  = ss.chart
+da_yun = ss.da_yun
+stars  = ss.stars
+ys,yb  = chart["year"]; ms,mb = chart["month"]
+ds,db  = chart["day"];  hs,hb = chart["hour"]
 ec     = chart["elements"]
 dm_name = STEMS_EL[ds]
 
+current_age = _Date.today().year - year
+
 st.markdown("---")
-st.markdown("<div style='font-size:11px;color:#888;margin-bottom:8px'>Four Pillars — Hour · Day · Month · Year</div>",
-            unsafe_allow_html=True)
 
-# Pillar cards
-st.markdown(
-    f'<div style="display:flex;gap:10px;margin-bottom:1.2rem">'
-    f'{pillar_card("Hour 时", hs, hb)}'
-    f'{pillar_card("Day 日",  ds, db, is_dm=True)}'
-    f'{pillar_card("Month 月", ms, mb)}'
-    f'{pillar_card("Year 年",  ys, yb)}'
-    f'</div>',
-    unsafe_allow_html=True,
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Chart", "Luck Pillars", "AI Insights", "Compatibility", "Chat"]
 )
 
-# Day master box
-st.markdown(f"""
-<div style="border:0.5px solid #ddd;border-radius:12px;padding:.9rem 1.1rem;
-            margin-bottom:1rem;background:#fff">
-  <div style="font-size:11px;color:#888;margin-bottom:5px">Day Master 日主</div>
-  <div style="font-size:15px;font-weight:600">{STEMS[ds]}{BRANCHES[db]} · {dm_name}</div>
-  <div style="font-size:12px;color:#666;margin-top:4px">{DM_DESC.get(dm_name, '')}</div>
-</div>""", unsafe_allow_html=True)
-
-# Element balance
-max_e = max(ec.values()) or 1
-elem_html = "".join(
-    f'<div style="background:{ECOL[el]["bg"]};border-radius:8px;padding:8px 4px;text-align:center;flex:1">'
-    f'<div style="font-size:10px;font-weight:500;color:{ECOL[el]["tx"]};margin-bottom:3px">{el}</div>'
-    f'<div style="font-size:18px;font-weight:500;color:{ECOL[el]["bar"]}">{ec[el]}</div>'
-    f'<div style="height:3px;border-radius:2px;background:#ddd;margin:5px 6px 0">'
-    f'<div style="height:3px;border-radius:2px;background:{ECOL[el]["bar"]};'
-    f'width:{round(ec[el]/max_e*100)}%"></div></div></div>'
-    for el in ["Wood", "Fire", "Earth", "Metal", "Water"]
-)
-st.markdown(
-    f'<div style="font-size:11px;color:#888;margin-bottom:6px">Element Balance (stems + branch main qi)</div>'
-    f'<div style="display:flex;gap:8px;margin-bottom:1.5rem">{elem_html}</div>',
-    unsafe_allow_html=True,
-)
-
-# ── AI Analysis ───────────────────────────────────────────────────────────────
-st.markdown("### AI Analysis")
-
-api_key = get_api_key()
-if not api_key:
-    st.warning(
-        "No Gemini API key found. "
-        "Add `GEMINI_API_KEY=...` to your `.env` file (local) "
-        "or Streamlit secrets (cloud) to enable AI analysis."
+# ═══════════════════════════════════════════════════════════════════
+# TAB 1 — CHART
+# ═══════════════════════════════════════════════════════════════════
+with tab1:
+    st.markdown("<div style='font-size:11px;color:#888;margin-bottom:8px'>Four Pillars — Hour · Day · Month · Year (hidden stems shown in each branch)</div>",
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;gap:10px;margin-bottom:1.2rem">'
+        f'{pillar_card("Hour 时", hs, hb)}'
+        f'{pillar_card("Day 日",  ds, db, is_dm=True)}'
+        f'{pillar_card("Month 月", ms, mb)}'
+        f'{pillar_card("Year 年",  ys, yb)}'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    st.stop()
 
-genai.configure(api_key=api_key)
-prompt = build_prompt(int(year), int(month), int(day), int(hour), int(minute), gender, chart)
+    # Day master box
+    st.markdown(f"""
+    <div style="border:0.5px solid #ddd;border-radius:12px;padding:.9rem 1.1rem;
+                margin-bottom:1rem;background:#fff">
+      <div style="font-size:11px;color:#888;margin-bottom:5px">Day Master 日主</div>
+      <div style="font-size:15px;font-weight:600">{STEMS[ds]}{BRANCHES[db]} · {dm_name}</div>
+      <div style="font-size:12px;color:#666;margin-top:4px">{DM_DESC.get(dm_name,'')}</div>
+    </div>""", unsafe_allow_html=True)
 
-with st.spinner("Consulting the stars..."):
-    try:
-        model = genai.GenerativeModel("gemini-flash-latest")
-        response = model.generate_content(prompt)
-        st.markdown(response.text)
-    except Exception as e:
-        st.error(f"Gemini API error: {e}")
+    # Element balance
+    st.markdown("<div style='font-size:11px;color:#888;margin-bottom:6px'>Element Balance (stems + branch main qi)</div>",
+                unsafe_allow_html=True)
+    st.markdown(f'<div style="margin-bottom:1.2rem">{elem_balance_html(ec)}</div>',
+                unsafe_allow_html=True)
+
+    # Special stars
+    if stars:
+        st.markdown("**Special Stars detected in your chart**")
+        for name, branch_name in stars.items():
+            desc = STAR_DESC.get(name, "")
+            st.markdown(
+                f'<div style="border:0.5px solid #ddd;border-radius:10px;padding:.7rem 1rem;'
+                f'margin-bottom:.5rem;background:#fff">'
+                f'<span style="font-size:13px;font-weight:600">{name}</span>'
+                f'<span style="font-size:11px;color:#888;margin-left:8px">in {branch_name}</span>'
+                f'<div style="font-size:12px;color:#555;margin-top:3px">{desc}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("No major special stars detected in the natal branches.")
+
+    # Share link
+    st.markdown("---")
+    col_share, col_export = st.columns(2)
+    with col_share:
+        if st.button("Copy share link", use_container_width=True):
+            st.info("URL updated — copy it from your browser's address bar.")
+    with col_export:
+        export_text = chart_text(chart, year, month, day, hour, minute, gender, da_yun, stars)
+        if ss.reading:
+            export_text += f"\n\n{'='*60}\nAI READING\n{'='*60}\n{ss.reading}"
+        if ss.forecast:
+            export_text += f"\n\n{'='*60}\nFORECAST\n{'='*60}\n{ss.forecast}"
+        st.download_button("Export reading (.txt)", data=export_text,
+                           file_name="bazi_reading.txt", mime="text/plain",
+                           use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 2 — LUCK PILLARS
+# ═══════════════════════════════════════════════════════════════════
+with tab2:
+    sy = da_yun["start_years"]
+    sm = da_yun["start_months"]
+    direction = "forward (顺行)" if da_yun["forward"] else "backward (逆行)"
+    st.markdown(
+        f"First luck pillar begins at age **{sy}** years {sm} months &nbsp;·&nbsp; "
+        f"Direction: **{direction}**",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div style='font-size:11px;color:#888;margin:10px 0 6px'>Scroll right to see all pillars — current period marked ★</div>",
+                unsafe_allow_html=True)
+
+    cards_html = "".join(
+        da_yun_card(p, year, p["start_age"] <= current_age <= p["end_age"])
+        for p in da_yun["pillars"]
+    )
+    st.markdown(
+        f'<div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:8px">{cards_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Active pillar detail
+    active = next((p for p in da_yun["pillars"]
+                   if p["start_age"] <= current_age <= p["end_age"]), None)
+    if active:
+        asi, abi = active["si"], active["bi"]
+        c = ECOL[stem_elem(asi)]
+        st.markdown(
+            f'<div style="border:0.5px solid #ddd;border-radius:12px;padding:.9rem 1.1rem;'
+            f'margin-top:1rem;background:#fff">'
+            f'<div style="font-size:11px;color:#888;margin-bottom:5px">Currently active luck pillar (age {active["start_age"]}–{active["end_age"]})</div>'
+            f'<div style="font-size:15px;font-weight:600">{STEMS[asi]}{BRANCHES[abi]} · '
+            f'<span style="background:{c["bg"]};color:{c["tx"]};padding:2px 8px;'
+            f'border-radius:8px;font-size:13px">{STEMS_EL[asi]}</span></div>'
+            f'<div style="font-size:12px;color:#666;margin-top:4px">'
+            f'{BR_EL[abi]} {BR_POL[abi]} {ANIMALS[abi]} branch</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 3 — AI INSIGHTS
+# ═══════════════════════════════════════════════════════════════════
+with tab3:
+    api_key = get_api_key()
+    if not api_key:
+        st.warning("Add `GEMINI_API_KEY` to `.env` (local) or Streamlit secrets (cloud) to enable AI features.")
+        st.stop()
+
+    # Natal reading
+    st.markdown("#### Natal Reading")
+    if ss.reading is None:
+        if st.button("Generate natal reading", use_container_width=True):
+            with st.spinner("Consulting the stars..."):
+                try:
+                    prompt = build_natal_prompt(chart, year, month, day, hour, minute,
+                                                gender, da_yun, stars)
+                    resp = gemini_model().generate_content(prompt)
+                    ss.reading = resp.text
+                except Exception as e:
+                    st.error(f"Gemini error: {e}")
+    if ss.reading:
+        st.markdown(ss.reading)
+        if st.button("Regenerate natal reading"):
+            ss.reading = None
+            st.rerun()
+
+    st.markdown("---")
+
+    # Forecast
+    st.markdown(f"#### {_Date.today().year} Forecast")
+    if ss.forecast is None:
+        if st.button("Generate annual forecast", use_container_width=True):
+            with st.spinner("Mapping the year ahead..."):
+                try:
+                    prompt = build_forecast_prompt(chart, year, month, day, hour, minute,
+                                                   gender, da_yun)
+                    resp = gemini_model().generate_content(prompt)
+                    ss.forecast = resp.text
+                except Exception as e:
+                    st.error(f"Gemini error: {e}")
+    if ss.forecast:
+        st.markdown(ss.forecast)
+        if st.button("Regenerate forecast"):
+            ss.forecast = None
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 4 — COMPATIBILITY
+# ═══════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown("Enter a second person's birth details to compare charts.")
+    with st.form("compat_form"):
+        cc1, cc2, cc3 = st.columns(3)
+        cy2 = cc1.number_input("Year",        min_value=1900, max_value=2100, value=1995, key="cy2")
+        cm2 = cc2.number_input("Month",       min_value=1,    max_value=12,   value=6,    key="cm2")
+        cd2 = cc3.number_input("Day",         min_value=1,    max_value=31,   value=15,   key="cd2")
+        cc4, cc5, cc6 = st.columns(3)
+        ch2 = cc4.number_input("Hour (0–23)", min_value=0,    max_value=23,   value=8,    key="ch2")
+        cmi2 = cc5.number_input("Minute",     min_value=0,    max_value=59,   value=0,    key="cmi2")
+        cg2 = cc6.selectbox("Gender", ["Male","Female"], key="cg2")
+        compat_submitted = st.form_submit_button("Compare Charts →", use_container_width=True)
+
+    if compat_submitted:
+        with st.spinner("Comparing charts..."):
+            try:
+                chart2 = calculate_bazi(int(cy2), int(cm2), int(cd2), int(ch2), int(cmi2))
+                prompt = build_compat_prompt(
+                    chart,  year,    month,    day,    hour,    minute,    gender,
+                    chart2, int(cy2), int(cm2), int(cd2), int(ch2), int(cmi2), cg2,
+                )
+                resp = gemini_model().generate_content(prompt)
+                ss.compat_reading = resp.text
+            except Exception as e:
+                st.error(f"Gemini error: {e}")
+
+    if ss.compat_reading:
+        st.markdown(ss.compat_reading)
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 5 — CHAT
+# ═══════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown("Ask me anything about your BaZi chart.")
+
+    # Initialize Gemini chat history with chart context on first open
+    if not ss.chat_history:
+        ctx_msg = build_chat_context(chart, da_yun, year, month, day, hour, minute, gender, stars)
+        ss.chat_history = [
+            {"role": "user",  "parts": [ctx_msg]},
+            {"role": "model", "parts": ["I've reviewed your full BaZi chart. Ask me anything — personality, career, relationships, health, your luck pillars, or what the current year holds for you."]},
+        ]
+        ss.chat_display = [
+            {"role": "assistant", "content": "I've reviewed your full BaZi chart. Ask me anything — personality, career, relationships, health, your luck pillars, or what the current year holds for you."},
+        ]
+
+    for msg in ss.chat_display:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_input = st.chat_input("Ask about your chart...")
+    if user_input:
+        ss.chat_display.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner(""):
+                try:
+                    chat_session = gemini_model().start_chat(history=ss.chat_history)
+                    resp = chat_session.send_message(user_input)
+                    answer = resp.text
+                    ss.chat_history.append({"role": "user",  "parts": [user_input]})
+                    ss.chat_history.append({"role": "model", "parts": [answer]})
+                    ss.chat_display.append({"role": "assistant", "content": answer})
+                    st.markdown(answer)
+                except Exception as e:
+                    st.error(f"Gemini error: {e}")
 
 st.markdown(
-    "<div style='font-size:11px;color:#999;margin-top:1rem'>"
-    "Formula: advanced fractional solar-term model (20th/21st century C-values)."
-    "</div>",
+    "<div style='font-size:11px;color:#999;margin-top:1.5rem;text-align:center'>"
+    "Formula: advanced fractional solar-term model · UTC+8 only · For reference purposes</div>",
     unsafe_allow_html=True,
 )
